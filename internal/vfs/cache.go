@@ -12,21 +12,47 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nwaples/rardecode"
+	"github.com/nwaples/rardecode/v2"
 )
+
+// ---- TOC types --------------------------------------------------------------
+
+// tocRecord is one entry in an archive's table of contents.
+type tocRecord struct {
+	name  string // normalised slash path, no trailing slash
+	isDir bool
+	size  int64
+	mod   time.Time
+}
+
+// tocEntry is the cached TOC for a single archive file.
+// It is invalidated when the archive's mtime or size changes.
+type tocEntry struct {
+	mtime   time.Time
+	size    int64
+	entries []tocRecord
+}
+
+// ---- Cache ------------------------------------------------------------------
 
 // Cache manages on-the-fly extraction of archive entries to a temp directory.
 // Each extracted file is stored at:
 //
-//	<cacheDir>/<archive-hash>/<inner-path>
+//	<cacheDir>/<archive-key>/<inner-path>
 //
-// Concurrent requests for the same entry are coalesced — only one goroutine
-// does the extraction while others wait.
+// TOCs are kept in memory after the first scan so that repeated
+// ReadDir / Stat calls never re-read the archive from disk.
+// A TOC is invalidated automatically when the archive's mtime or size changes.
 type Cache struct {
 	dir string
 
-	mu      sync.Mutex
-	pending map[string]*extractTask // key = cacheKey(archive, inner)
+	// coalescing: only one goroutine extracts a given (archive, inner) pair
+	extractMu sync.Mutex
+	pending   map[string]*extractTask
+
+	// TOC cache — one entry per archive path
+	tocMu  sync.RWMutex
+	tocMap map[string]*tocEntry
 }
 
 type extractTask struct {
@@ -39,10 +65,69 @@ func NewCache(dir string) (*Cache, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("cache dir: %w", err)
 	}
-	return &Cache{dir: dir, pending: make(map[string]*extractTask)}, nil
+	return &Cache{
+		dir:     dir,
+		pending: make(map[string]*extractTask),
+		tocMap:  make(map[string]*tocEntry),
+	}, nil
 }
 
-// OpenEntry returns a ReadCloser for the given innerPath inside archivePath.
+// toc returns a valid (possibly cached) TOC for archivePath.
+// It re-reads the archive only when mtime or size has changed.
+func (c *Cache) toc(archivePath string) (*tocEntry, error) {
+	fi, err := os.Stat(archivePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fast path: valid cached TOC (read lock).
+	c.tocMu.RLock()
+	if e, ok := c.tocMap[archivePath]; ok {
+		if e.mtime.Equal(fi.ModTime()) && e.size == fi.Size() {
+			c.tocMu.RUnlock()
+			return e, nil
+		}
+	}
+	c.tocMu.RUnlock()
+
+	// Slow path: build TOC from disk.
+	c.tocMu.Lock()
+	defer c.tocMu.Unlock()
+
+	// Re-check after acquiring write lock (another goroutine may have built it).
+	if e, ok := c.tocMap[archivePath]; ok {
+		if e.mtime.Equal(fi.ModTime()) && e.size == fi.Size() {
+			return e, nil
+		}
+	}
+
+	low := strings.ToLower(archivePath)
+	var records []tocRecord
+	switch {
+	case strings.HasSuffix(low, ".zip"):
+		records, err = readZipTOC(archivePath)
+	case strings.HasSuffix(low, ".rar"):
+		records, err = readRarTOC(archivePath)
+	default:
+		return nil, fmt.Errorf("unsupported archive: %s", archivePath)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	entry := &tocEntry{
+		mtime:   fi.ModTime(),
+		size:    fi.Size(),
+		entries: records,
+	}
+	c.tocMap[archivePath] = entry
+	log.Printf("[cache] TOC built for %s (%d entries)", archivePath, len(records))
+	return entry, nil
+}
+
+// ---- public API -------------------------------------------------------------
+
+// OpenEntry returns a ReadCloser for innerPath inside archivePath.
 // The file is extracted to the cache on first access; subsequent accesses
 // read directly from the cached file.
 func (c *Cache) OpenEntry(archivePath, innerPath string) (io.ReadCloser, error) {
@@ -50,12 +135,11 @@ func (c *Cache) OpenEntry(archivePath, innerPath string) (io.ReadCloser, error) 
 
 	// Fast path: already cached.
 	if _, err := os.Stat(dest); err == nil {
-		// Touch access time for eviction purposes.
 		_ = os.Chtimes(dest, time.Now(), time.Now())
 		return os.Open(dest)
 	}
 
-	// Slow path: extract.
+	// Slow path: extract then open.
 	if err := c.extract(archivePath, innerPath, dest); err != nil {
 		return nil, err
 	}
@@ -63,33 +147,45 @@ func (c *Cache) OpenEntry(archivePath, innerPath string) (io.ReadCloser, error) 
 }
 
 // StatEntry returns FileInfo for innerPath inside the archive.
+// Uses the in-memory TOC — no disk I/O after the first call per archive.
 func (c *Cache) StatEntry(archivePath, innerPath string) (fs.FileInfo, error) {
-	low := strings.ToLower(archivePath)
-	switch {
-	case strings.HasSuffix(low, ".zip"):
-		return c.statZip(archivePath, innerPath)
-	case strings.HasSuffix(low, ".rar"):
-		return c.statRar(archivePath, innerPath)
-	default:
-		return nil, fmt.Errorf("unsupported archive: %s", archivePath)
+	toc, err := c.toc(archivePath)
+	if err != nil {
+		return nil, err
 	}
+
+	// Exact match first.
+	for i := range toc.entries {
+		r := &toc.entries[i]
+		if r.name == innerPath {
+			if r.isDir {
+				return &syntheticDirInfo{name: filepath.Base(r.name), mod: r.mod}, nil
+			}
+			return &syntheticFileInfo{name: filepath.Base(r.name), size: r.size, mod: r.mod}, nil
+		}
+	}
+	// Virtual directory implied by a child entry.
+	prefix := innerPath + "/"
+	for i := range toc.entries {
+		if strings.HasPrefix(toc.entries[i].name, prefix) {
+			return &syntheticDirInfo{name: filepath.Base(innerPath), mod: toc.entries[i].mod}, nil
+		}
+	}
+	return nil, &fs.PathError{Op: "stat", Path: innerPath, Err: fs.ErrNotExist}
 }
 
-// ListDir returns FileInfo for all direct children of dirPath inside the archive.
+// ListDir returns FileInfo for direct children of dirPath inside the archive.
 // dirPath == "" means the root of the archive.
+// Uses the in-memory TOC — no disk I/O after the first call per archive.
 func (c *Cache) ListDir(archivePath, dirPath string) ([]fs.FileInfo, error) {
-	low := strings.ToLower(archivePath)
-	switch {
-	case strings.HasSuffix(low, ".zip"):
-		return c.listZip(archivePath, dirPath)
-	case strings.HasSuffix(low, ".rar"):
-		return c.listRar(archivePath, dirPath)
-	default:
-		return nil, fmt.Errorf("unsupported archive: %s", archivePath)
+	toc, err := c.toc(archivePath)
+	if err != nil {
+		return nil, err
 	}
+	return listEntriesFromRecords(dirPath, toc.entries), nil
 }
 
-// Evict removes cached files not accessed within maxAge. Returns the count.
+// Evict removes cached extracted files not accessed within maxAge.
 func (c *Cache) Evict(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge)
 	var count int
@@ -108,25 +204,62 @@ func (c *Cache) Evict(maxAge time.Duration) (int, error) {
 		}
 		return nil
 	})
-	// Clean empty subdirs.
 	_ = removeEmptyDirs(c.dir)
 	return count, err
 }
 
-// ---- extraction -------------------------------------------------------------
+// ---- TOC readers (called once per archive, then cached) ---------------------
+
+func readZipTOC(archivePath string) ([]tocRecord, error) {
+	r, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	records := make([]tocRecord, 0, len(r.File))
+	for _, f := range r.File {
+		records = append(records, tocRecord{
+			name:  normZipName(f.Name),
+			isDir: f.FileInfo().IsDir(),
+			size:  int64(f.UncompressedSize64),
+			mod:   f.Modified,
+		})
+	}
+	return records, nil
+}
+
+func readRarTOC(archivePath string) ([]tocRecord, error) {
+	files, err := rardecode.List(archivePath)
+	if err != nil {
+		return nil, fmt.Errorf("rardecode.List: %w", err)
+	}
+	records := make([]tocRecord, 0, len(files))
+	for _, f := range files {
+		records = append(records, tocRecord{
+			name:  normRarName(f.Name),
+			isDir: f.IsDir,
+			size:  f.UnPackedSize,
+			mod:   f.ModificationTime,
+		})
+	}
+	return records, nil
+}
+
+// ---- extraction (on first file access) --------------------------------------
 
 func (c *Cache) extract(archivePath, innerPath, dest string) error {
 	key := archivePath + "|" + innerPath
 
-	c.mu.Lock()
+	c.extractMu.Lock()
 	if task, ok := c.pending[key]; ok {
-		c.mu.Unlock()
+		c.extractMu.Unlock()
 		<-task.done
 		return task.err
 	}
 	task := &extractTask{done: make(chan struct{})}
 	c.pending[key] = task
-	c.mu.Unlock()
+	c.extractMu.Unlock()
 
 	go func() {
 		task.err = c.doExtract(archivePath, innerPath, dest)
@@ -135,9 +268,9 @@ func (c *Cache) extract(archivePath, innerPath, dest string) error {
 		}
 		close(task.done)
 
-		c.mu.Lock()
+		c.extractMu.Lock()
 		delete(c.pending, key)
-		c.mu.Unlock()
+		c.extractMu.Unlock()
 	}()
 
 	<-task.done
@@ -159,7 +292,7 @@ func (c *Cache) doExtract(archivePath, innerPath, dest string) error {
 	}
 }
 
-// ---- ZIP support ------------------------------------------------------------
+// ---- ZIP extraction ---------------------------------------------------------
 
 func extractZipEntry(archivePath, innerPath, dest string) error {
 	r, err := zip.OpenReader(archivePath)
@@ -181,147 +314,38 @@ func extractZipEntry(archivePath, innerPath, dest string) error {
 	return fmt.Errorf("entry not found in zip: %s", innerPath)
 }
 
-func (c *Cache) statZip(archivePath, innerPath string) (fs.FileInfo, error) {
-	r, err := zip.OpenReader(archivePath)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-
-	for _, f := range r.File {
-		if normZipName(f.Name) == innerPath {
-			return f.FileInfo(), nil
-		}
-		// Also match as a directory prefix.
-		if strings.HasPrefix(normZipName(f.Name)+"/", innerPath+"/") {
-			return &syntheticDirInfo{name: filepath.Base(innerPath), mod: f.Modified}, nil
-		}
-	}
-	return nil, &fs.PathError{Op: "stat", Path: innerPath, Err: fs.ErrNotExist}
-}
-
-func (c *Cache) listZip(archivePath, dirPath string) ([]fs.FileInfo, error) {
-	r, err := zip.OpenReader(archivePath)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-
-	return listEntriesFromNames(dirPath, func(yield func(name string, isDir bool, size int64, mod time.Time)) {
-		for _, f := range r.File {
-			n := normZipName(f.Name)
-			isDir := f.FileInfo().IsDir()
-			yield(n, isDir, int64(f.UncompressedSize64), f.Modified)
-		}
-	}), nil
-}
-
 func normZipName(n string) string {
-	n = strings.TrimSuffix(n, "/")
-	return n
+	return strings.TrimSuffix(n, "/")
 }
 
-// ---- RAR support ------------------------------------------------------------
+// ---- RAR extraction ---------------------------------------------------------
 
+// extractRarEntry uses rardecode.OpenFS (v2) to open the archive as an fs.FS
+// and stream only the requested entry to dest. No full-archive scan needed.
 func extractRarEntry(archivePath, innerPath, dest string) error {
-	rr, err := rardecode.OpenReader(archivePath, "")
+	rfs, err := rardecode.OpenFS(archivePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("rardecode.OpenFS: %w", err)
 	}
-	defer rr.Close()
 
-	for {
-		hdr, err := rr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if normRarName(hdr.Name) == innerPath {
-			return writeFile(rr, dest)
-		}
-	}
-	return fmt.Errorf("entry not found in rar: %s", innerPath)
-}
-
-func (c *Cache) statRar(archivePath, innerPath string) (fs.FileInfo, error) {
-	rr, err := rardecode.OpenReader(archivePath, "")
+	src, err := rfs.Open(innerPath)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("rfs.Open %s: %w", innerPath, err)
 	}
-	defer rr.Close()
+	defer src.Close()
 
-	for {
-		hdr, err := rr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		n := normRarName(hdr.Name)
-		if n == innerPath {
-			return &rarFileInfo{hdr: hdr}, nil
-		}
-		if strings.HasPrefix(n+"/", innerPath+"/") {
-			return &syntheticDirInfo{name: filepath.Base(innerPath), mod: hdr.ModificationTime}, nil
-		}
-	}
-	return nil, &fs.PathError{Op: "stat", Path: innerPath, Err: fs.ErrNotExist}
-}
-
-func (c *Cache) listRar(archivePath, dirPath string) ([]fs.FileInfo, error) {
-	rr, err := rardecode.OpenReader(archivePath, "")
-	if err != nil {
-		return nil, err
-	}
-	defer rr.Close()
-
-	type entry struct {
-		name  string
-		isDir bool
-		size  int64
-		mod   time.Time
-	}
-	var entries []entry
-	for {
-		hdr, err := rr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, entry{
-			name:  normRarName(hdr.Name),
-			isDir: hdr.IsDir,
-			size:  hdr.UnPackedSize,
-			mod:   hdr.ModificationTime,
-		})
-	}
-
-	return listEntriesFromNames(dirPath, func(yield func(name string, isDir bool, size int64, mod time.Time)) {
-		for _, e := range entries {
-			yield(e.name, e.isDir, e.size, e.mod)
-		}
-	}), nil
+	return writeFile(src, dest)
 }
 
 func normRarName(n string) string {
 	n = filepath.ToSlash(n)
-	n = strings.TrimSuffix(n, "/")
-	return n
+	return strings.TrimSuffix(n, "/")
 }
 
-// ---- generic listing helper -------------------------------------------------
+// ---- listing helper ---------------------------------------------------------
 
-// listEntriesFromNames scans a flat list of archive entries and returns the
-// direct children of dirPath (like os.ReadDir but for in-memory name sets).
-func listEntriesFromNames(
-	dirPath string,
-	each func(yield func(name string, isDir bool, size int64, mod time.Time)),
-) []fs.FileInfo {
+// listEntriesFromRecords returns direct children of dirPath from a flat TOC.
+func listEntriesFromRecords(dirPath string, records []tocRecord) []fs.FileInfo {
 	seen := make(map[string]bool)
 	var infos []fs.FileInfo
 
@@ -330,29 +354,30 @@ func listEntriesFromNames(
 		prefix += "/"
 	}
 
-	each(func(name string, isDir bool, size int64, mod time.Time) {
-		name = filepath.ToSlash(name)
+	for i := range records {
+		r := &records[i]
+		name := r.name
 		if !strings.HasPrefix(name, prefix) {
-			return
+			continue
 		}
 		rel := strings.TrimPrefix(name, prefix)
 		if rel == "" {
-			return
+			continue
 		}
 		parts := strings.SplitN(rel, "/", 2)
 		child := parts[0]
 		if child == "" || seen[child] {
-			return
+			continue
 		}
 		seen[child] = true
 
-		childIsDir := len(parts) > 1 || isDir
+		childIsDir := len(parts) > 1 || r.isDir
 		if childIsDir {
-			infos = append(infos, &syntheticDirInfo{name: child, mod: mod})
+			infos = append(infos, &syntheticDirInfo{name: child, mod: r.mod})
 		} else {
-			infos = append(infos, &syntheticFileInfo{name: child, size: size, mod: mod})
+			infos = append(infos, &syntheticFileInfo{name: child, size: r.size, mod: r.mod})
 		}
-	})
+	}
 	return infos
 }
 
@@ -387,7 +412,6 @@ func removeEmptyDirs(root string) error {
 }
 
 func (c *Cache) destPath(archivePath, innerPath string) string {
-	// Use the archive path as a directory name (replace separators).
 	archKey := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(archivePath)
 	return filepath.Join(c.dir, archKey, filepath.FromSlash(innerPath))
 }
@@ -419,17 +443,8 @@ func (s *syntheticFileInfo) ModTime() time.Time { return s.mod }
 func (s *syntheticFileInfo) IsDir() bool        { return false }
 func (s *syntheticFileInfo) Sys() any           { return nil }
 
-type rarFileInfo struct {
-	hdr *rardecode.FileHeader
-}
-
-func (r *rarFileInfo) Name() string       { return filepath.Base(normRarName(r.hdr.Name)) }
-func (r *rarFileInfo) Size() int64        { return r.hdr.UnPackedSize }
-func (r *rarFileInfo) Mode() fs.FileMode  { return 0o444 }
-func (r *rarFileInfo) ModTime() time.Time { return r.hdr.ModificationTime }
-func (r *rarFileInfo) IsDir() bool        { return r.hdr.IsDir }
-func (r *rarFileInfo) Sys() any           { return nil }
-
+// archiveDirInfo wraps a real fs.FileInfo and makes the archive appear as a
+// directory to the SMB/WebDAV layer.
 type archiveDirInfo struct {
 	fs.FileInfo
 }
