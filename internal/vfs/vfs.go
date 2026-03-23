@@ -82,6 +82,9 @@ func (v *FS) ReadDir(vpath string) ([]fs.FileInfo, error) {
 			if err != nil {
 				continue
 			}
+			if strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
 			if isArchive(e.Name()) {
 				fi = &archiveDirInfo{fi}
 			}
